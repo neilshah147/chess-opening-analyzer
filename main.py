@@ -28,38 +28,42 @@ async def load_openings_db():
     try:
         async with httpx.AsyncClient() as client:
             print("Fetching Lichess openings database...")
-            response = await client.get("https://lichess.org/api/opening/tree/main", timeout=20)
+            response = await client.get("https://lichess.org/api/opening/tree/main", timeout=20, headers={"Accept": "application/json"})
             response.raise_for_status()
             data = response.json()
             
             # Build opening database from tree
-            def process_openings(node, prefix=""):
-                if 'uci' in node:
-                    moves_str = prefix + (" " + node['uci'] if prefix else node['uci'])
-                else:
-                    moves_str = prefix
+            def process_node(node, current_moves=""):
+                if not node:
+                    return
                 
-                if moves_str and 'eco' in node and 'name' in node:
-                    OPENINGS_DB[moves_str] = {
-                        'eco': node.get('eco'),
-                        'name': node.get('name')
+                # Get the UCI move for this node
+                uci = node.get('uci', '')
+                if uci:
+                    current_moves = (current_moves + ' ' + uci).strip()
+                
+                # If this node has name and eco, it's an opening
+                if 'name' in node:
+                    OPENINGS_DB[current_moves] = {
+                        'eco': node.get('eco', ''),
+                        'name': node.get('name', 'Unknown')
                     }
                 
-                # Recursively process children
+                # Process children
                 for child in node.get('children', []):
-                    new_prefix = moves_str + (" " + child.get('uci', '')) if moves_str else child.get('uci', '')
-                    process_openings(child, new_prefix)
+                    process_node(child, current_moves)
             
-            process_openings(data)
+            process_node(data)
             print(f"Loaded {len(OPENINGS_DB)} openings from Lichess")
     except Exception as e:
         print(f"Warning: Could not load Lichess openings: {e}")
+        print("Using fallback openings...")
 
-# Load openings on startup
+# Try to load on startup, but don't block if it fails
 try:
     asyncio.run(load_openings_db())
-except:
-    print("Could not load openings asynchronously, will load on first request")
+except Exception as e:
+    print(f"Failed to load on startup: {e}")
 
 class OpeningClassifier:
     @staticmethod
@@ -88,19 +92,21 @@ class OpeningClassifier:
             
             move_sequence = move_sequence.strip()
             
-            # Try to match against database
-            for i in range(len(move_sequence.split()), 0, -1):
-                key = " ".join(move_sequence.split()[:i])
+            # Try to match against database (longest match first)
+            moves_list = move_sequence.split()
+            for i in range(len(moves_list), 0, -1):
+                key = " ".join(moves_list[:i])
                 if key in OPENINGS_DB:
                     return {
                         'moves': key,
-                        'eco': OPENINGS_DB[key]['eco'],
-                        'name': OPENINGS_DB[key]['name']
+                        'eco': OPENINGS_DB[key].get('eco', ''),
+                        'name': OPENINGS_DB[key].get('name', 'Unknown Opening')
                     }
             
+            # If no match found, try to get from Lichess API with the move sequence
             return {
                 'moves': move_sequence,
-                'eco': None,
+                'eco': '',
                 'name': 'Unknown Opening'
             }
         except Exception as e:
@@ -143,7 +149,7 @@ def analyze_openings(games: list, username: str) -> dict:
             continue
         
         opening_name = opening_info['name']
-        eco = opening_info.get('eco')
+        eco = opening_info.get('eco', '')
         
         if opening_name not in opening_stats:
             opening_stats[opening_name] = {
