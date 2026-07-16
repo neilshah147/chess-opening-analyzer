@@ -5,16 +5,13 @@ import chess
 import json
 import os
 from typing import Optional
-import csv
-from io import StringIO
+import asyncio
 
-# Groq configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 app = FastAPI()
 
-# CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,65 +20,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Lichess openings dataset
 OPENINGS_DB = {}
 
-def load_openings_db():
-    """Load Lichess openings database from TSV format"""
-    # We'll fetch from GitHub or use inline data
-    # For now, using a simplified version - can be expanded
-    openings_csv = """move_sequence	eco	name
-e2e4	B20	Sicilian Defense
-e2e4 c7c5	B20	Sicilian Defense: Open
-e2e4 c7c5 g1f3	B21	Sicilian Defense: Closed
-e2e4 e7e5	C20	Open Game
-e2e4 e7e5 g1f3	C25	Vienna Game
-d2d4	D00	Queen's Gambit Declined
-d2d4 d7d5	D05	Queen's Gambit Declined
-d2d4 g8f6	D10	Slav Defense
-c2c4	A10	English Opening
-g1f3	A04	Reti Opening"""
-    
-    lines = openings_csv.strip().split('\n')
-    reader = csv.DictReader(StringIO('\n'.join(lines)), delimiter='\t')
-    
-    for row in reader:
-        OPENINGS_DB[row['move_sequence']] = {
-            'eco': row['eco'],
-            'name': row['name']
-        }
+async def load_openings_db():
+    """Load Lichess openings database from API"""
+    global OPENINGS_DB
+    try:
+        async with httpx.AsyncClient() as client:
+            print("Fetching Lichess openings database...")
+            response = await client.get("https://lichess.org/api/opening/tree/main", timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Build opening database from tree
+            def process_openings(node, prefix=""):
+                if 'uci' in node:
+                    moves_str = prefix + (" " + node['uci'] if prefix else node['uci'])
+                else:
+                    moves_str = prefix
+                
+                if moves_str and 'eco' in node and 'name' in node:
+                    OPENINGS_DB[moves_str] = {
+                        'eco': node.get('eco'),
+                        'name': node.get('name')
+                    }
+                
+                # Recursively process children
+                for child in node.get('children', []):
+                    new_prefix = moves_str + (" " + child.get('uci', '')) if moves_str else child.get('uci', '')
+                    process_openings(child, new_prefix)
+            
+            process_openings(data)
+            print(f"Loaded {len(OPENINGS_DB)} openings from Lichess")
+    except Exception as e:
+        print(f"Warning: Could not load Lichess openings: {e}")
 
-load_openings_db()
+# Load openings on startup
+try:
+    asyncio.run(load_openings_db())
+except:
+    print("Could not load openings asynchronously, will load on first request")
 
 class OpeningClassifier:
-    """Classify chess openings from PGN"""
-    
     @staticmethod
     def get_opening_moves(pgn_string: str, max_moves: int = 10) -> Optional[dict]:
-        """Extract opening from PGN and classify it"""
         try:
             board = chess.Board()
             move_sequence = ""
             move_count = 0
-            
-            # Parse PGN moves
             pgn_tokens = pgn_string.split()
             
             for token in pgn_tokens:
-                # Skip move numbers and annotations
                 if token[-1] in '.!?':
                     token = token[:-1]
                 if token[-1] in '!?':
                     token = token[:-1]
-                
                 if any(c.isdigit() for c in token) and token[0].isdigit():
                     continue
-                
                 try:
                     move = board.push_san(token)
                     move_sequence += move.uci() + " "
                     move_count += 1
-                    
                     if move_count >= max_moves:
                         break
                 except:
@@ -89,7 +88,7 @@ class OpeningClassifier:
             
             move_sequence = move_sequence.strip()
             
-            # Try exact match and partial matches
+            # Try to match against database
             for i in range(len(move_sequence.split()), 0, -1):
                 key = " ".join(move_sequence.split()[:i])
                 if key in OPENINGS_DB:
@@ -99,8 +98,6 @@ class OpeningClassifier:
                         'name': OPENINGS_DB[key]['name']
                     }
             
-            # Fallback: return first move
-            first_move = move_sequence.split()[0] if move_sequence else None
             return {
                 'moves': move_sequence,
                 'eco': None,
@@ -111,45 +108,37 @@ class OpeningClassifier:
             return None
 
 async def fetch_player_games(username: str, limit: int = 500) -> list:
-    """Fetch player's games from Chess.com API"""
     games = []
-    
     try:
         async with httpx.AsyncClient() as client:
-            # Get archives list
             archives_url = f"https://api.chess.com/pub/player/{username}/games/archives"
             archives_response = await client.get(archives_url, timeout=10)
             archives_response.raise_for_status()
             archives_data = archives_response.json()
-            
             archives = archives_data.get('archives', [])
             
-            # Iterate through recent months
-            for archive_url in reversed(archives[-12:]):  # Last 12 months
+            for archive_url in reversed(archives[-12:]):
                 archive_response = await client.get(archive_url, timeout=10)
                 archive_response.raise_for_status()
                 archive_data = archive_response.json()
                 
                 for game in archive_data.get('games', []):
-                    # Only include rated games
                     if game.get('rated'):
                         games.append(game)
                         if len(games) >= limit:
                             return games
-    
     except httpx.HTTPError as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch player games: {str(e)}")
     
     return games
 
-def analyze_openings(games: list) -> dict:
-    """Analyze opening statistics from games"""
+def analyze_openings(games: list, username: str) -> dict:
     opening_stats = {}
     
     for game in games:
         pgn = game.get('pgn', '')
-        
         opening_info = OpeningClassifier.get_opening_moves(pgn)
+        
         if not opening_info:
             continue
         
@@ -167,14 +156,20 @@ def analyze_openings(games: list) -> dict:
                 'frequency': 0
             }
         
-        # Determine if player was white or black
-        white_username = game.get('white', {}).get('username', '').lower() if isinstance(game.get('white'), dict) else ''
-        black_username = game.get('black', {}).get('username', '').lower() if isinstance(game.get('black'), dict) else ''
+        # Determine player color and result
+        white_player = game.get('white', {})
+        black_player = game.get('black', {})
         
-        player_is_white = white_username == username.lower() if 'username' in locals() else False
+        white_username = white_player.get('username', '').lower() if isinstance(white_player, dict) else ''
+        black_username = black_player.get('username', '').lower() if isinstance(black_player, dict) else ''
+        player_lower = username.lower()
         
-        result_key = 'white' if player_is_white else 'black'
-        result = game.get(result_key, {}).get('result') if isinstance(game.get(result_key), dict) else ''
+        if white_username == player_lower:
+            result = white_player.get('result', '') if isinstance(white_player, dict) else ''
+        elif black_username == player_lower:
+            result = black_player.get('result', '') if isinstance(black_player, dict) else ''
+        else:
+            continue
         
         opening_stats[opening_name]['games'] += 1
         
@@ -185,13 +180,12 @@ def analyze_openings(games: list) -> dict:
         elif result in ['draw', 'agreed']:
             opening_stats[opening_name]['draws'] += 1
     
-    # Calculate frequencies and sort
     total_games = sum(s['games'] for s in opening_stats.values())
+    
     for stats in opening_stats.values():
         stats['frequency'] = (stats['games'] / total_games * 100) if total_games > 0 else 0
         stats['win_rate'] = (stats['wins'] / stats['games'] * 100) if stats['games'] > 0 else 0
     
-    # Sort by frequency
     sorted_openings = sorted(
         opening_stats.values(),
         key=lambda x: x['frequency'],
@@ -201,7 +195,6 @@ def analyze_openings(games: list) -> dict:
     return {'openings': sorted_openings, 'total_games': total_games}
 
 async def get_ai_insights(opponent_data: dict) -> list:
-    """Get AI insights using Groq"""
     if not GROQ_API_KEY:
         return ["Groq API key not configured"]
     
@@ -247,7 +240,6 @@ Keep each point to one sentence."""
             data = response.json()
             text = data['choices'][0]['message']['content']
             
-            # Parse response into bullet points
             insights = text.split('\n')
             insights = [line.strip() for line in insights if line.strip() and (line.strip()[0] == '-' or line.strip()[0].isdigit())]
             
@@ -258,18 +250,14 @@ Keep each point to one sentence."""
 
 @app.get("/api/analyze/{username}")
 async def analyze_opponent(username: str, include_ai: Optional[bool] = False):
-    """Analyze opponent's opening repertoire"""
     try:
-        # Fetch games
         games = await fetch_player_games(username)
         
         if not games:
             raise HTTPException(status_code=404, detail=f"No games found for player {username}")
         
-        # Analyze openings
-        opening_analysis = analyze_openings(games)
+        opening_analysis = analyze_openings(games, username)
         
-        # Get AI insights if requested
         ai_insights = []
         if include_ai:
             ai_insights = await get_ai_insights(opening_analysis)
