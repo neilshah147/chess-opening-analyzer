@@ -237,7 +237,7 @@ Keep each point to one sentence."""
                     "max_tokens": 500,
                     "temperature": 0.7
                 },
-                timeout=30
+                timeout=120
             )
             
             if response.status_code != 200:
