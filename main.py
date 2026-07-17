@@ -42,6 +42,10 @@ class OpeningClassifier:
                     move_number = int(token[:-1])
                     continue
                 
+                # Skip Black's move indicators like "1..." "2..." etc.
+                if token and token.endswith('...') and token[:-3].isdigit():
+                    continue
+                
                 # Skip if it's a move number without dot
                 if token.isdigit():
                     continue
