@@ -2,10 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import chess
-import json
 import os
 from typing import Optional
-import asyncio
+from openings import OPENINGS_DB
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -20,100 +19,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENINGS_DB = {}
-
-async def load_openings_db():
-    """Load Lichess openings database from API"""
-    global OPENINGS_DB
-    try:
-        async with httpx.AsyncClient() as client:
-            print("Fetching Lichess openings database...")
-            response = await client.get("https://lichess.org/api/opening/tree/main", timeout=20, headers={"Accept": "application/json"})
-            response.raise_for_status()
-            data = response.json()
-            
-            # Build opening database from tree
-            def process_node(node, current_moves=""):
-                if not node:
-                    return
-                
-                # Get the UCI move for this node
-                uci = node.get('uci', '')
-                if uci:
-                    current_moves = (current_moves + ' ' + uci).strip()
-                
-                # If this node has name and eco, it's an opening
-                if 'name' in node:
-                    OPENINGS_DB[current_moves] = {
-                        'eco': node.get('eco', ''),
-                        'name': node.get('name', 'Unknown')
-                    }
-                
-                # Process children
-                for child in node.get('children', []):
-                    process_node(child, current_moves)
-            
-            process_node(data)
-            print(f"Loaded {len(OPENINGS_DB)} openings from Lichess")
-    except Exception as e:
-        print(f"Warning: Could not load Lichess openings: {e}")
-        print("Using fallback openings...")
-
-# Try to load on startup, but don't block if it fails
-try:
-    asyncio.run(load_openings_db())
-except Exception as e:
-    print(f"Failed to load on startup: {e}")
-
 class OpeningClassifier:
     @staticmethod
-    def get_opening_moves(pgn_string: str, max_moves: int = 10) -> Optional[dict]:
+    def get_opening_from_pgn(pgn_string: str, max_moves: int = 15) -> Optional[dict]:
+        """Extract and classify opening from PGN"""
         try:
             board = chess.Board()
-            move_sequence = ""
+            moves_algebraic = ""
             move_count = 0
+            move_number = 1
             pgn_tokens = pgn_string.split()
             
             for token in pgn_tokens:
-                if token[-1] in '.!?':
+                # Remove annotation symbols
+                if token and token[-1] in '.!?':
                     token = token[:-1]
-                if token[-1] in '!?':
+                if token and token[-1] in '!?':
                     token = token[:-1]
-                if any(c.isdigit() for c in token) and token[0].isdigit():
+                
+                # Skip move numbers (they look like "1.", "2.", etc.)
+                if token and token[-1] == '.' and token[:-1].isdigit():
+                    move_number = int(token[:-1])
                     continue
+                
+                # Skip if it's a move number without dot
+                if token.isdigit():
+                    continue
+                
                 try:
                     move = board.push_san(token)
-                    move_sequence += move.uci() + " "
                     move_count += 1
+                    
+                    # Build algebraic notation string like "1. e4 c5 2. Nf3"
+                    is_white = (move_count % 2 == 1)
+                    if is_white:
+                        if moves_algebraic:
+                            moves_algebraic += f" {move_number}. {token}"
+                        else:
+                            moves_algebraic = f"1. {token}"
+                    else:
+                        moves_algebraic += f" {token}"
+                        move_number += 1
+                    
                     if move_count >= max_moves:
                         break
                 except:
                     pass
             
-            move_sequence = move_sequence.strip()
+            # Try to match in database (longest match first)
+            # Remove trailing move numbers for matching
+            clean_moves = moves_algebraic.strip()
             
-            # Try to match against database (longest match first)
-            moves_list = move_sequence.split()
-            for i in range(len(moves_list), 0, -1):
-                key = " ".join(moves_list[:i])
+            for i in range(min(len(clean_moves.split()), 20), 0, -1):
+                # Try progressively shorter move sequences
+                words = clean_moves.split()
+                key = " ".join(words[:i])
+                
                 if key in OPENINGS_DB:
                     return {
-                        'moves': key,
-                        'eco': OPENINGS_DB[key].get('eco', ''),
-                        'name': OPENINGS_DB[key].get('name', 'Unknown Opening')
+                        'name': OPENINGS_DB[key]['name'],
+                        'eco': OPENINGS_DB[key]['eco']
                     }
             
-            # If no match found, try to get from Lichess API with the move sequence
             return {
-                'moves': move_sequence,
-                'eco': '',
-                'name': 'Unknown Opening'
+                'name': 'Unknown Opening',
+                'eco': ''
             }
         except Exception as e:
             print(f"Error classifying opening: {e}")
-            return None
+            return {'name': 'Unknown Opening', 'eco': ''}
 
 async def fetch_player_games(username: str, limit: int = 500) -> list:
+    """Fetch player's games from Chess.com"""
     games = []
     try:
         async with httpx.AsyncClient() as client:
@@ -139,16 +116,14 @@ async def fetch_player_games(username: str, limit: int = 500) -> list:
     return games
 
 def analyze_openings(games: list, username: str) -> dict:
+    """Analyze opening statistics"""
     opening_stats = {}
     
     for game in games:
         pgn = game.get('pgn', '')
-        opening_info = OpeningClassifier.get_opening_moves(pgn)
+        opening_info = OpeningClassifier.get_opening_from_pgn(pgn)
         
-        if not opening_info:
-            continue
-        
-        opening_name = opening_info['name']
+        opening_name = opening_info.get('name', 'Unknown Opening')
         eco = opening_info.get('eco', '')
         
         if opening_name not in opening_stats:
@@ -159,10 +134,11 @@ def analyze_openings(games: list, username: str) -> dict:
                 'wins': 0,
                 'losses': 0,
                 'draws': 0,
-                'frequency': 0
+                'frequency': 0,
+                'win_rate': 0
             }
         
-        # Determine player color and result
+        # Get result
         white_player = game.get('white', {})
         black_player = game.get('black', {})
         
@@ -170,11 +146,13 @@ def analyze_openings(games: list, username: str) -> dict:
         black_username = black_player.get('username', '').lower() if isinstance(black_player, dict) else ''
         player_lower = username.lower()
         
+        result = None
         if white_username == player_lower:
             result = white_player.get('result', '') if isinstance(white_player, dict) else ''
         elif black_username == player_lower:
             result = black_player.get('result', '') if isinstance(black_player, dict) else ''
-        else:
+        
+        if not result:
             continue
         
         opening_stats[opening_name]['games'] += 1
@@ -201,58 +179,41 @@ def analyze_openings(games: list, username: str) -> dict:
     return {'openings': sorted_openings, 'total_games': total_games}
 
 async def get_ai_insights(opponent_data: dict) -> list:
+    """Get AI insights from Groq"""
     if not GROQ_API_KEY:
         return ["Groq API key not configured"]
     
     try:
         openings_summary = "\n".join([
-            f"- {o['name']} ({o['eco'] or 'Unknown ECO'}): {o['games']} games, {o['win_rate']:.1f}% win rate"
+            f"- {o['name']} ({o['eco'] or 'Unknown'}): {o['games']} games, {o['win_rate']:.1f}% win rate"
             for o in opponent_data['openings'][:10]
         ])
         
-        prompt = f"""Analyze this chess player's opening repertoire and provide 3-4 bullet-point insights about their strengths and weaknesses:
+        prompt = f"""Analyze this chess player's opening repertoire. Provide 3-4 bullet-point insights:
 
 {openings_summary}
 
-Total games analyzed: {opponent_data['total_games']}
+Total games: {opponent_data['total_games']}
 
-Provide concise, actionable insights for someone preparing to play against this opponent. Focus on:
-1. Their strongest openings
-2. Their weaker systems
-3. Recommended preparation strategy
-
-Keep each point to one sentence."""
+Focus on: 1) Strongest openings, 2) Weaknesses, 3) Prep strategy. One sentence per point."""
         
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{GROQ_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "openai/gpt-oss-120b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
-                    "temperature": 0.7
-                },
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0.7},
                 timeout=120
             )
             
             if response.status_code != 200:
-                print(f"Groq API error: {response.status_code} - {response.text}")
-                return ["Could not generate AI insights at this time"]
+                return ["Could not generate AI insights"]
             
             data = response.json()
             text = data['choices'][0]['message']['content']
-            
-            insights = text.split('\n')
-            insights = [line.strip() for line in insights if line.strip() and (line.strip()[0] == '-' or line.strip()[0].isdigit())]
-            
-            return insights[:4] if insights else ["Analysis complete - see opening statistics above"]
-    except Exception as e:
-        print(f"Error getting AI insights: {e}")
-        return ["Could not generate AI insights at this time"]
+            insights = [line.strip() for line in text.split('\n') if line.strip() and (line.strip()[0] == '-' or line.strip()[0].isdigit())]
+            return insights[:4] if insights else ["Analysis complete"]
+    except:
+        return ["Could not generate AI insights"]
 
 @app.get("/api/analyze/{username}")
 async def analyze_opponent(username: str, include_ai: Optional[bool] = False):
@@ -274,11 +235,10 @@ async def analyze_opponent(username: str, include_ai: Optional[bool] = False):
             'openings': opening_analysis['openings'],
             'ai_insights': ai_insights
         }
-    
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing opponent: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
