@@ -25,11 +25,10 @@ class OpeningClassifier:
         """Extract and classify opening from PGN"""
         try:
             board = chess.Board()
-            moves_algebraic = ""
-            move_count = 0
-            move_number = 1
+            moves_list = []  # Store moves in order
             pgn_tokens = pgn_string.split()
             
+            # Extract all valid moves from PGN
             for token in pgn_tokens:
                 # Remove annotation symbols
                 if token and token[-1] in '.!?':
@@ -39,45 +38,53 @@ class OpeningClassifier:
                 
                 # Skip move numbers (they look like "1.", "2.", etc.)
                 if token and token[-1] == '.' and token[:-1].isdigit():
-                    move_number = int(token[:-1])
                     continue
                 
                 # Skip Black's move indicators like "1..." "2..." etc.
                 if token and token.endswith('...') and token[:-3].isdigit():
                     continue
                 
-                # Skip if it's a move number without dot
+                # Skip if it's just a digit
                 if token.isdigit():
                     continue
                 
+                # Skip clock annotations like {[%clk ...]}
+                if token.startswith('{') or token.startswith('[%'):
+                    continue
+                
+                # Try to parse as a move
                 try:
                     move = board.push_san(token)
-                    move_count += 1
-                    
-                    # Build algebraic notation string like "1. e4 c5 2. Nf3"
-                    is_white = (move_count % 2 == 1)
-                    if is_white:
-                        if moves_algebraic:
-                            moves_algebraic += f" {move_number}. {token}"
-                        else:
-                            moves_algebraic = f"1. {token}"
-                    else:
-                        moves_algebraic += f" {token}"
-                        move_number += 1
-                    
-                    if move_count >= max_moves:
+                    moves_list.append(token)
+                    if len(moves_list) >= max_moves:
                         break
                 except:
                     pass
             
-            # Try to match in database (longest match first)
-            # Remove trailing move numbers for matching
-            clean_moves = moves_algebraic.strip()
+            if not moves_list:
+                return {'name': 'Unknown Opening', 'eco': ''}
             
-            for i in range(min(len(clean_moves.split()), 20), 0, -1):
-                # Try progressively shorter move sequences
-                words = clean_moves.split()
-                key = " ".join(words[:i])
+            # Build algebraic notation with proper move numbers: "1. e4 c6 2. d4 d5 ..."
+            moves_algebraic = ""
+            for i, move in enumerate(moves_list):
+                move_num = (i // 2) + 1  # Move number (1, 2, 3, ...)
+                is_white = (i % 2 == 0)  # White plays on even indices (0, 2, 4, ...)
+                
+                if is_white:
+                    if moves_algebraic:
+                        moves_algebraic += f" {move_num}. {move}"
+                    else:
+                        moves_algebraic = f"1. {move}"
+                else:
+                    moves_algebraic += f" {move}"
+            
+            # Try to match in database (longest match first)
+            clean_moves = moves_algebraic.strip()
+            moves_words = clean_moves.split()
+            
+            # Try progressively shorter sequences
+            for i in range(min(len(moves_words), 20), 0, -1):
+                key = " ".join(moves_words[:i])
                 
                 if key in OPENINGS_DB:
                     return {
