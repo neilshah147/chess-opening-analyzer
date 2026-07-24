@@ -29,8 +29,131 @@ function AnalyzerForm({ onSearch, disabled }) {
   );
 }
 
-function ResultsDisplay({ results, showECO, aiInsights, loadingAI, onGetInsights }) {
+const MONTH_OPTIONS = [
+  { value: 3, label: 'Last 3 months' },
+  { value: 12, label: 'Last 12 months' },
+  { value: 0, label: 'All time' },
+];
+
+function statsFor(item, color) {
+  return color === 'all' ? item : item[color];
+}
+
+function StatCells({ item, color, colorTotal, showRecord }) {
+  const s = statsFor(item, color);
+  const freq = colorTotal > 0 ? (s.games / colorTotal) * 100 : 0;
+  return (
+    <>
+      <div className="stat-value-small">{freq.toFixed(1)}%</div>
+      <div className="stat-value-small">
+        {s.games}
+        {showRecord && (
+          <div className="wld-record">{s.wins}-{s.losses}-{s.draws}</div>
+        )}
+      </div>
+      <div className="stat-value-small win-rate">{s.win_rate.toFixed(1)}%</div>
+    </>
+  );
+}
+
+function FamilyTable({ families, color, showECO }) {
+  const [expanded, setExpanded] = useState({});
+
+  const colorTotal = families.reduce(
+    (sum, f) => sum + statsFor(f, color).games, 0
+  );
+
+  const visible = families
+    .filter((f) => statsFor(f, color).games > 0)
+    .sort((a, b) => statsFor(b, color).games - statsFor(a, color).games);
+
+  const toggle = (name) =>
+    setExpanded((prev) => ({ ...prev, [name]: !prev[name] }));
+
+  return (
+    <div className="openings-list">
+      <div className="opening-card" style={{ background: 'var(--color-green-light)', fontWeight: 600 }}>
+        <div>Opening</div>
+        <div>Frequency</div>
+        <div>Games</div>
+        <div>Win Rate</div>
+      </div>
+      {visible.map((family) => {
+        const hasVariations = family.variations && family.variations.length > 1;
+        const isOpen = !!expanded[family.name];
+        const subVariations = hasVariations
+          ? family.variations.filter((v) => statsFor(v, color).games > 0)
+          : [];
+        return (
+          <React.Fragment key={family.name}>
+            <div
+              className={`opening-card family-row${hasVariations ? ' clickable' : ''}`}
+              onClick={hasVariations ? () => toggle(family.name) : undefined}
+            >
+              <div className="opening-name">
+                {hasVariations && (
+                  <span className="chevron">{isOpen ? '▾' : '▸'}</span>
+                )}
+                {family.name}
+                {hasVariations && (
+                  <span className="variation-count">
+                    {subVariations.length} variations
+                  </span>
+                )}
+                {showECO && family.eco && (
+                  <div className="opening-eco">[{family.eco}]</div>
+                )}
+              </div>
+              <StatCells item={family} color={color} colorTotal={colorTotal} showRecord />
+            </div>
+            {isOpen &&
+              subVariations.map((v) => (
+                <div key={v.name} className="opening-card variation-row">
+                  <div className="opening-name variation-name">
+                    {v.name}
+                    {showECO && v.eco && (
+                      <div className="opening-eco">[{v.eco}]</div>
+                    )}
+                  </div>
+                  <StatCells item={v} color={color} colorTotal={colorTotal} showRecord={false} />
+                </div>
+              ))}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+function FlatTable({ openings, showECO }) {
+  return (
+    <div className="openings-list">
+      <div className="opening-card" style={{ background: 'var(--color-green-light)', fontWeight: 600 }}>
+        <div>Opening</div>
+        <div>Frequency</div>
+        <div>Games</div>
+        <div>Win Rate</div>
+      </div>
+      {openings.map((opening, idx) => (
+        <div key={idx} className="opening-card">
+          <div className="opening-name">
+            {opening.name}
+            {showECO && opening.eco && (
+              <div className="opening-eco">[{opening.eco}]</div>
+            )}
+          </div>
+          <div className="stat-value-small">{opening.frequency.toFixed(1)}%</div>
+          <div className="stat-value-small">{opening.games}</div>
+          <div className="stat-value-small win-rate">{opening.win_rate.toFixed(1)}%</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ResultsDisplay({ results, showECO, color, aiInsights, loadingAI, onGetInsights }) {
   const openings = results?.openings || [];
+  const families = results?.families || null;
   const totalGames = results?.total_games_analyzed || 0;
 
   return (
@@ -39,6 +162,7 @@ function ResultsDisplay({ results, showECO, aiInsights, loadingAI, onGetInsights
         <h2>{results.username}</h2>
         <p style={{ color: 'var(--color-text-muted)', fontSize: '0.95rem' }}>
           Analysis based on {totalGames} rated games
+          {results.months === 0 ? ' (all time)' : results.months ? ` (last ${results.months} months)` : ''}
         </p>
       </div>
 
@@ -54,34 +178,18 @@ function ResultsDisplay({ results, showECO, aiInsights, loadingAI, onGetInsights
         <div className="stat-item">
           <span className="stat-label">Most Played Opening</span>
           <span className="stat-value" style={{ fontSize: '1.1rem' }}>
-            {openings[0]?.name?.split(':')[0] || 'N/A'}
+            {(families ? families[0]?.name : openings[0]?.name?.split(':')[0]) || 'N/A'}
           </span>
         </div>
       </div>
 
       <div>
         <h3 style={{ marginBottom: '1rem', color: 'var(--color-text)' }}>Opening Repertoire</h3>
-        <div className="openings-list">
-          <div className="opening-card" style={{ background: 'var(--color-green-light)', fontWeight: 600 }}>
-            <div>Opening</div>
-            <div>Frequency</div>
-            <div>Games</div>
-            <div>Win Rate</div>
-          </div>
-          {openings.map((opening, idx) => (
-            <div key={idx} className="opening-card">
-              <div className="opening-name">
-                {opening.name}
-                {showECO && opening.eco && (
-                  <div className="opening-eco">[{opening.eco}]</div>
-                )}
-              </div>
-              <div className="stat-value-small">{opening.frequency.toFixed(1)}%</div>
-              <div className="stat-value-small">{opening.games}</div>
-              <div className="stat-value-small win-rate">{opening.win_rate.toFixed(1)}%</div>
-            </div>
-          ))}
-        </div>
+        {families ? (
+          <FamilyTable families={families} color={color} showECO={showECO} />
+        ) : (
+          <FlatTable openings={openings} showECO={showECO} />
+        )}
       </div>
 
       <div className="ai-insights-section">
@@ -130,20 +238,24 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [showECO, setShowECO] = useState(false);
+  const [months, setMonths] = useState(12);
+  const [color, setColor] = useState('all');
   const [aiInsights, setAiInsights] = useState(null);
   const [loadingAI, setLoadingAI] = useState(false);
 
   const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
-  const handleSearch = async (username) => {
+  const runSearch = async (username, monthsValue) => {
     setLoading(true);
     setError(null);
     setResults(null);
     setAiInsights(null);
 
     try {
-      const response = await fetch(`${API_BASE}/api/analyze/${username}`);
-      
+      const response = await fetch(
+        `${API_BASE}/api/analyze/${username}?months=${monthsValue}`
+      );
+
       if (!response.ok) {
         throw new Error(`Player not found or error: ${response.statusText}`);
       }
@@ -157,6 +269,15 @@ function App() {
     }
   };
 
+  const handleSearch = (username) => runSearch(username, months);
+
+  const handleMonthsChange = (value) => {
+    setMonths(value);
+    if (results?.username) {
+      runSearch(results.username, value);
+    }
+  };
+
   const handleGetAIInsights = async () => {
     if (!results) return;
 
@@ -164,7 +285,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `${API_BASE}/api/analyze/${results.username}?include_ai=true`
+        `${API_BASE}/api/analyze/${results.username}?include_ai=true&months=${months}`
       );
 
       if (!response.ok) {
@@ -205,11 +326,39 @@ function App() {
                 />
                 Show ECO Codes
               </label>
+
+              <div className="toggle-group">
+                {MONTH_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    className={`toggle-button${months === opt.value ? ' active' : ''}`}
+                    onClick={() => handleMonthsChange(opt.value)}
+                    disabled={loading}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              {results.families && (
+                <div className="toggle-group">
+                  {['all', 'white', 'black'].map((c) => (
+                    <button
+                      key={c}
+                      className={`toggle-button${color === c ? ' active' : ''}`}
+                      onClick={() => setColor(c)}
+                    >
+                      {c === 'all' ? 'All games' : c === 'white' ? 'As White' : 'As Black'}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             <ResultsDisplay
               results={results}
               showECO={showECO}
+              color={color}
               aiInsights={aiInsights}
               loadingAI={loadingAI}
               onGetInsights={handleGetAIInsights}
